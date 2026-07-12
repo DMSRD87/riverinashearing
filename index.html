@@ -534,8 +534,10 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.11b';
+const APP_VERSION='v4.6.11d';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
+/* v4.6.11d (12 Jul 2026): crew job-card SMS trimmed to a teaser (greeting + contractor + start date + link + do-not-reply). Full job detail now lives BEHIND the link only, so crew must OPEN it to see the job - which writes the green 'viewed' receipt on the Overview (the point of the trim, per contractor feedback). Also drops the crew card from 3 Twilio segments to 2 (clears the body-trim open thread). Contractor name used once to hold the 2-segment ceiling for long names. GSM-7 only. Broadcast send body was already hyphen/GSM-7 (only its on-screen preview carries em-dashes - cosmetic, not billed); left untouched. Carries forward the 4.6.11c farmer view-receipt. */
+/* v4.6.11c (12 Jul 2026): farmer view-receipt on Overview. Completes 4.6.11 farmer access. The farmer SMS link now carries &crew=farmer.FARMID so the farmer's tap writes the SAME job_views receipt the crew get (existing deep-link handler is identity-agnostic - no write-path change, no DB/schema change). Overview renders an admin-only farmer row (distinct from crew - farmer lives on the farm blob, not job.crew) keyed on views['farmer.'+farmId] showing Viewed/Not-yet-opened. HONEST SCOPE: this is a link-tap receipt on whatever device opened the link, NOT proof the grower personally read it - same limitation the crew tags already carry; never oversell it as read-confirmation. */
 /* v4.6.11b (9 Jul 2026): per-contractor crew-view toggle. contractor_settings.app_settings JSONB, key crewView: 'all' = read_only devices see the full app with no Who-are-you picker (pre-4.6.10 behaviour, for contractors who do not want per-person filtering); unset or 'mine' = crew view unchanged. Cached to LS_APP_SETTINGS on the same boot fetch as default rates; offline-first boot defaults to 'mine' until first online boot. Server-flippable per contractor without redeploy. */
 /* v4.6.11a HOTFIX (8 Jul 2026, caught in pilot, console-proven): PostgrestBuilder from the CDN supabase-js@2 is a thenable WITHOUT .catch on at least some cached versions - three pre-existing inline 'sb.from(...)....catch(()=>{})' sites threw TypeError synchronously, killing the handler mid-function: Edit Farm never saved to DB and never closed (both handleSaveFarm sites), and crew delete never reached the DB. Fix is class-wide: route through real async fns (dbSaveFarm; new dbDeleteCrew mirroring dbDeleteFarm) which also adds LS cache + offline queueing that the inline calls skipped. RULE: never chain .catch directly on a Supabase builder - always await inside an async fn or use established db* helpers. NOTE: supabase-js is loaded UNPINNED (@2) from CDN - pinning is an open thread, not a mid-pilot change. */
 /* v4.6.11 BOOK PHOTO + FARMER ACCESS + CONTRACTOR DEFAULT RATES (8 Jul 2026): (0) CONTRACTOR DEFAULT RATES - contractor_settings.default_rates JSONB (nullable, additive) is the durable home for new-job rate seeding, closing the per-device LS_LAST_RATES caveat (field report: a pilot contractor lead asked three times for a stable rate sheet; DB evidence showed the per-device sticky drifting across jobs). Boot fetches into LS_DEFAULT_RATES cache; mkRates layers field-level default->last-used->hardcoded. No admin UI yet - set via SQL; the dashboard Settings tab becomes the UI later. Missing column/row/offline degrades to pre-4.6.11 behaviour exactly. (1) END-OF-DAY BOOK PHOTO - one slot per job per day, bottom of Tally tab (lead/admin take; lead/admin/farmer view). Camera -> client-side canvas compression (max 1600px JPEG q0.72) -> Supabase Storage bucket 'book-photos', path slug/jobId/date.jpg + upsert row in book_photos (timestamped, natural key slug/job/date). Re-take replaces. REQUIRES SIGNAL by design - honest hold on device, NO offline queue (multi-MB localStorage queueing is the fragile pattern v5 kills). (2) FARMER ACCESS - farm blob gains farmerName/farmerPhone/farmerPinHash (SHA-256(pin+slug), same pattern as role PINs; farms table schema unchanged). New device role 'farmer': role switch -> pick farm (only farms with a farmer PIN set) -> PIN pad -> LS_FARMER_ID binds device. Farmer sees ONLY their farm's jobs on Home, full per-shearer/per-run tallies (farmers who count out manually cross-check the board - that is the point), day notes read-only, whiteboard read+post (author defaults to Farmer), Summary non-admin view, book photo. NEVER: rates, pay, super, other farms, tally editing, Schedule, Admin. Farmer role persists across the 12h timeout (read-only scope, less privilege than lead). PIN-gated visibility filter, NOT real auth - v5. (3) Farmer SMS modal pre-fills from farm record. (4) Job hero shows farmer emergency tel: contact for lead/admin. */
@@ -4108,6 +4110,27 @@ function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onP
         role==='admin'&&e('div',{style:{fontFamily:'var(--m)',fontSize:'11px',color:'var(--dim)'}},c.phone)
       );
     }),
+    /* v4.6.11c — farmer view-receipt row (admin only). The farmer is NOT a crew member;
+       he lives on the farm blob, so he renders here as a separate row keyed on the
+       synthetic id 'farmer.'+farmId that his SMS link carries. Same Viewed/Not-opened
+       tag the crew get. It's a link-tap receipt, not read-confirmation. */
+    role==='admin'&&farm&&(farm.farmerName||farm.farmerPhone)&&(function(){
+      const fViewed=views['farmer.'+job.farmId];
+      return e('div',{key:'farmer-row',className:'crew-row',style:{borderTop:'1px dashed var(--border)'}},
+        e('div',{className:'cr-l'},
+          e(Av,{name:farm.farmerName||'Farmer'}),
+          e('div',null,
+            e('div',{className:'cr-name'},'🌾 '+(farm.farmerName||'Farmer')),
+            e('div',{className:'cr-role'},'Farmer (grower)'),
+            farm.farmerPhone&&(fViewed
+              ?e('div',{style:{fontSize:11,color:'var(--green)',fontWeight:700,marginTop:2}},'👁 Viewed '+fmtViewed(fViewed))
+              :e('div',{style:{fontSize:11,color:'var(--dim)',marginTop:2}},'⌛ Not yet opened')
+            )
+          )
+        ),
+        farm.farmerPhone&&e('div',{style:{fontFamily:'var(--m)',fontSize:'11px',color:'var(--dim)'}},farm.farmerPhone)
+      );
+    })(),
     /* Draft → show Publish button instead of Send */
     isDraft&&role==='admin'&&onPublish&&e('div',{className:'send-bar'},
       e('button',{className:'send-btn',onClick:onPublish,style:{background:'linear-gradient(135deg,#dc2626,#991b1b)',boxShadow:'0 4px 16px rgba(220,38,38,.3)'}},'🚀 Publish Job & Send Cards to Crew')
@@ -4309,18 +4332,19 @@ function buildJobCardSMS(job,crewId,farmList,crewList,appUrl){
   const endDate=jds.length?jds[jds.length-1]:job.startDate;
   const teamNames=job.crew.map(id=>{const c=gcl(id);if(!c)return null;return {c,id};}).filter(Boolean).map(({c,id})=>c.name+' ('+(getJobRole(job,id)||c.role)+')').join(', ');
   const jobName=job.jobName||(farm?farm.name:'Farm');
+  /* v4.6.11d — teaser body by design: minimal detail forces the crew to OPEN the link
+     to see the job, which is what writes the green 'viewed' receipt on the Overview.
+     Contractor name used ONCE (not twice) to hold the 2-segment ceiling even for long
+     names. GSM-7 only — never introduce emoji or em-dash here (em-dash forces UCS-2 and
+     doubles the bill). Full job detail lives behind the link, not in the SMS. */
   return [
-    'Hi '+crew.name.split(' ')[0]+'! You have been added to a job with '+CONTRACTOR_NAME+'.',
+    'Hi '+crew.name.split(' ')[0]+', you have been added to a job with '+CONTRACTOR_NAME+' starting '+fmtDate(job.startDate)+'.',
     '',
-    jobName+' - '+job.type,
-    'Start: '+fmtDate(job.startDate)+'  End: '+fmtDate(endDate),
-    'Sheep: '+(job.totalSheep||0).toLocaleString(),
-    farm?'Address: '+farm.address:'',
+    'Open the link to view the job:',
+    appUrl+'#job='+job.id+'&crew='+crewId,
     '',
-    'View job details: '+appUrl+'#job='+job.id+'&crew='+crewId,
-    'Do not reply to this message - contact me directly.',
-    '- '+CONTRACTOR_NAME+' via myGang'
-  ].filter(l=>l!==null&&l!=='').join('\n');
+    'Please do not reply to this text - contact us directly with any questions.'
+  ].join('\n');
 }
 
 function buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl){
@@ -4336,7 +4360,7 @@ function buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl){
     'Sheep: '+(job.totalSheep||0).toLocaleString(),
     farm?'Address: '+farm.address:'',
     '',
-    'View job details: '+appUrl+'#job='+job.id,
+    'View job details: '+appUrl+'#job='+job.id+'&crew=farmer.'+job.farmId, /* v4.6.11c - farmer identity so the tap writes a job_views receipt via the existing deep-link handler */
     '',
     'Questions? Call or reply to this message.',
     '- '+CONTRACTOR_NAME+' via myGang'
