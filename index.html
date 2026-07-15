@@ -534,8 +534,10 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.11d';
+const APP_VERSION='v4.6.11f';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
+/* v4.6.11f (15 Jul 2026, shed-visit follow-up, built on the DEPLOYED 11e codebase): two fixes with DB-proven mechanisms. (1) QUERY-STRING DEEP LINKS - a crew Android did multiple clean full boots (pageshow persisted=false + fresh mountLoad) while its owner's SMS link was tapped, wrote NO job_views receipt, and logged ZERO deeplink/swallow errors: the boot handler ran and simply saw no hash, because Android strips the #fragment when handing a link to an installed PWA (and some SMS linkifiers end the tappable URL at '#'). An iPhone booting 30s later kept its fragment and receipted instantly. SMS builders now emit /?job=&crew= QUERY links - queries survive intent launches and linkifiers, and a query navigation into a warm instance is a FULL PAGE LOAD (unlike a hash change), so the boot handler covers warm-instance taps with no extra listener. Handler reads location.search first, falls back to location.hash so every previously-sent link keeps working; URL cleaned with history.replaceState (no reload, no history spam). HONEST SCOPE: legacy hash links tapped on fragment-stripping handsets still cannot receipt - the parameter never reaches the app; any 11f re-send fixes that person permanently. (2) FARMER NAME TRAP REMOVED - both farmer send paths required phone AND name; a real farm record with phone set but farmerName='' passed every UI check and then silently dropped the farmer from the bulk send AND hid the farmer row's Preview/Send buttons (tickbox on, phone showing, no SMS, no error, no buttons - the full field report 15 Jul). Both gates are now PHONE-ONLY; a blank name falls back to 'there' in the SMS greeting. */
+/* v4.6.11e (15 Jul 2026): (1) IN-FLIGHT TALLY FLUSH - closes the pocket-lock write gap (14 Jul, two contractor jobs, DB-proven): a per-cell tally write dispatched in the instant before the phone locks is frozen mid-flight by iOS - the fetch dies AND the 5s timeout timer freezes, so neither the success path nor the catch->queue path runs until the page resumes; the server holds the PREVIOUS keystroke's value (viewer on another device saw '3' of a '37') for the whole pocket period, and a BFCache restore that drops the promise makes the stale value permanent. Fix: TALLY_INFLIGHT map tracks every dispatched cell row; on visibilitychange->hidden / pagehide / beforeunload the rows are dumped SYNCHRONOUSLY into LS_TALLY_QUEUE (localStorage survives the freeze; existing 20s background drain + goOnline flush push them on resume) plus a best-effort keepalive REST upsert so the server usually gets the final value even while the phone stays pocketed. Idempotent by design - a cell may be upserted twice with the same value. HONEST SCOPE: keepalive is not guaranteed once iOS freezes the page; the guarantee is the queue (value can no longer be lost), the keepalive just shrinks the stale window from 'until device resumes' to usually-immediate. (2) FARMER SEND ROW - farmer gets his own row in Send Job Cards (avatar/name/phone/viewed receipt/Preview/Send) so a contractor can send or re-send the farmer link WITHOUT re-texting the whole crew; the 'Also send to farmer' tickbox stays for the bulk path. Preview reuses JobCardView (greeting is crew-gated, renders clean for farmer identity). Send requires farm record farmerName+farmerPhone - edit via the tickbox fields or Edit Farm. */
 /* v4.6.11d (12 Jul 2026): crew job-card SMS trimmed to a teaser (greeting + contractor + start date + link + do-not-reply). Full job detail now lives BEHIND the link only, so crew must OPEN it to see the job - which writes the green 'viewed' receipt on the Overview (the point of the trim, per contractor feedback). Also drops the crew card from 3 Twilio segments to 2 (clears the body-trim open thread). Contractor name used once to hold the 2-segment ceiling for long names. GSM-7 only. Broadcast send body was already hyphen/GSM-7 (only its on-screen preview carries em-dashes - cosmetic, not billed); left untouched. Carries forward the 4.6.11c farmer view-receipt. */
 /* v4.6.11c (12 Jul 2026): farmer view-receipt on Overview. Completes 4.6.11 farmer access. The farmer SMS link now carries &crew=farmer.FARMID so the farmer's tap writes the SAME job_views receipt the crew get (existing deep-link handler is identity-agnostic - no write-path change, no DB/schema change). Overview renders an admin-only farmer row (distinct from crew - farmer lives on the farm blob, not job.crew) keyed on views['farmer.'+farmId] showing Viewed/Not-yet-opened. HONEST SCOPE: this is a link-tap receipt on whatever device opened the link, NOT proof the grower personally read it - same limitation the crew tags already carry; never oversell it as read-confirmation. */
 /* v4.6.11b (9 Jul 2026): per-contractor crew-view toggle. contractor_settings.app_settings JSONB, key crewView: 'all' = read_only devices see the full app with no Who-are-you picker (pre-4.6.10 behaviour, for contractors who do not want per-person filtering); unset or 'mine' = crew view unchanged. Cached to LS_APP_SETTINGS on the same boot fetch as default rates; offline-first boot defaults to 'mine' until first online boot. Server-flippable per contractor without redeploy. */
@@ -721,6 +723,44 @@ function queueTallyCell(row){
   lsSet(LS_TALLY_QUEUE,filtered);
 }
 
+/* v4.6.11e — in-flight cell write tracking (14 Jul pocket-lock incident,
+   proven on two contractors' jobs). A cell write dispatched just before the
+   phone locks is frozen mid-flight: the fetch dies AND the withTimeout timer
+   freezes with the page, so neither success nor the catch->queue path runs
+   until (or unless) the page resumes cleanly. The server keeps the previous
+   keystroke's value for the whole pocket period. TALLY_INFLIGHT holds every
+   dispatched row until its upsert settles; flushInflightTallies dumps
+   unsettled rows into LS_TALLY_QUEUE synchronously on page hide. */
+const TALLY_INFLIGHT=new Map();
+
+function flushInflightTallies(){
+  if(TALLY_INFLIGHT.size===0)return;
+  const rows=[...TALLY_INFLIGHT.values()];
+  TALLY_INFLIGHT.clear();
+  /* Synchronous localStorage write — survives the page freeze. The existing
+     20s background drain / goOnline flush pushes these on resume. queueTallyCell
+     dedups per cell key so a row that also lands via keepalive or a resumed
+     fetch just re-upserts the same value — harmless. */
+  rows.forEach(queueTallyCell);
+  /* Best-effort push while the page can still speak: fetch keepalive is
+     allowed to complete after the page hides on modern WebKit/Blink. NOT
+     guaranteed — the queue above is the actual safety net. */
+  try{
+    fetch(SUPABASE_URL+'/rest/v1/tally_entries?on_conflict=contractor_slug,job_id,cell_date,kind,run_id,mob_id,crew_id',{
+      method:'POST',
+      keepalive:true,
+      headers:{
+        'apikey':SUPABASE_ANON_KEY,
+        'Authorization':'Bearer '+SUPABASE_ANON_KEY,
+        'Content-Type':'application/json',
+        'Prefer':'resolution=merge-duplicates'
+      },
+      body:JSON.stringify(rows)
+    }).catch(()=>{});
+  }catch(e){}
+  try{logSaveFailure('diag_save','inflight_dump','n='+rows.length);}catch(e){}
+}
+
 /* writeTallyCell — upserts a single cell to Supabase, or queues it if offline.
    This is fired on every tally-cell change. No debounce; the volume is fine. */
 async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,mobDesc}){
@@ -749,6 +789,10 @@ async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,
     queueTallyCell(row);
     return;
   }
+  /* v4.6.11e — register as in-flight until the upsert settles. If the page
+     hides while this write is airborne, flushInflightTallies queues it. */
+  const _ik=tallyKey(row);
+  TALLY_INFLIGHT.set(_ik,row);
   try{
     const result=await withTimeout(
       sb.from('tally_entries').upsert(row,{
@@ -758,7 +802,10 @@ async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,
       'tally_upsert_timeout'
     );
     if(result&&result.error)throw new Error(result.error.message);
+    /* Only clear if a newer write for the same cell hasn't replaced our entry */
+    if(TALLY_INFLIGHT.get(_ik)===row)TALLY_INFLIGHT.delete(_ik);
   }catch(e){
+    if(TALLY_INFLIGHT.get(_ik)===row)TALLY_INFLIGHT.delete(_ik);
     queueTallyCell(row);
     logSaveFailure(
       e.message==='tally_upsert_timeout'?'timeout':'error',
@@ -4341,7 +4388,7 @@ function buildJobCardSMS(job,crewId,farmList,crewList,appUrl){
     'Hi '+crew.name.split(' ')[0]+', you have been added to a job with '+CONTRACTOR_NAME+' starting '+fmtDate(job.startDate)+'.',
     '',
     'Open the link to view the job:',
-    appUrl+'#job='+job.id+'&crew='+crewId,
+    appUrl+'/?job='+job.id+'&crew='+crewId, /* v4.6.11f - query not fragment: fragments are stripped by Android PWA intent launches and some SMS linkifiers */
     '',
     'Please do not reply to this text - contact us directly with any questions.'
   ].join('\n');
@@ -4360,7 +4407,7 @@ function buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl){
     'Sheep: '+(job.totalSheep||0).toLocaleString(),
     farm?'Address: '+farm.address:'',
     '',
-    'View job details: '+appUrl+'#job='+job.id+'&crew=farmer.'+job.farmId, /* v4.6.11c - farmer identity so the tap writes a job_views receipt via the existing deep-link handler */
+    'View job details: '+appUrl+'/?job='+job.id+'&crew=farmer.'+job.farmId, /* v4.6.11f - query not fragment */ /* v4.6.11c - farmer identity so the tap writes a job_views receipt via the existing deep-link handler */
     '',
     'Questions? Call or reply to this message.',
     '- '+CONTRACTOR_NAME+' via myGang'
@@ -4412,6 +4459,48 @@ function CrewSMSRow({id,c,views,status,onPreview,job,farmList,crewList,appUrl}){
   );
 }
 
+/* v4.6.11e — farmer's own row in Send Job Cards. Mirrors CrewSMSRow so a
+   contractor can send/re-send JUST the farmer link without re-texting the
+   crew. Viewed receipt keyed on the synthetic 'farmer.'+farmId identity the
+   farmer SMS link already carries (4.6.11c). Send needs farmerName+farmerPhone
+   — the tickbox fields below (or Edit Farm) supply them. */
+function FarmerSMSRow({job,views,onPreview,farmList,appUrl,farmerName,farmerPhone}){
+  const [fSending,setFSending]=useState(false);
+  const [fSent,setFSent]=useState(false);
+  const farmerId='farmer.'+job.farmId;
+  const viewedAt=views[farmerId];
+  const ready=!!farmerPhone; /* v4.6.11f: phone-only - requiring a name too hid Preview/Send entirely on a phone-but-no-name farm record (field case 15 Jul) */
+  const sendOne=async()=>{
+    if(!ready)return;
+    setFSending(true);
+    try{
+      await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({messages:[{to:farmerPhone,body:buildFarmerSMS(job,farmerName||'there',farmerPhone,farmList,appUrl)}]})});
+      setFSent(true);
+    }catch(e){}
+    setFSending(false);
+  };
+  return e('div',{className:'sms-row',style:{borderTop:'1px dashed var(--border)'}},
+    e('div',{className:'sms-l'},
+      e('div',{style:{width:40,height:40,borderRadius:'50%',background:'#5c2018',color:'#f5c518',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'var(--h)',fontSize:'15px',fontWeight:'700',flexShrink:0}},'F'),
+      e('div',null,
+        e('div',{className:'sms-name'},'🌾 '+(farmerName||'Farmer')),
+        e('div',{className:'sms-role'},'Farmer (grower)'),
+        e('div',{className:'sms-ph'},farmerPhone||e('span',{style:{color:'var(--red)'}},'No number — add below')),
+        viewedAt&&e('div',{style:{fontSize:11,color:'var(--green)',fontWeight:700,marginTop:2}},'👁 Viewed '+fmtViewed(viewedAt))
+      )
+    ),
+    e('div',{style:{display:'flex',flexDirection:'column',gap:4,alignItems:'flex-end'}},
+      ready&&e('button',{className:'prev-btn',onClick:()=>onPreview(farmerId)},'Preview'),
+      ready&&e('button',{type:'button',onClick:sendOne,disabled:fSending||fSent,
+        style:{fontSize:11,padding:'4px 10px',borderRadius:6,border:'none',cursor:'pointer',fontWeight:700,
+          background:fSent?'var(--green)':fSending?'var(--muted)':'var(--amber)',color:'#000'}},
+        fSent?'✓ Sent':fSending?'...':'Send'),
+      !viewedAt&&ready&&e('div',{style:{fontSize:10,color:'var(--muted)'}},'')
+    )
+  );
+}
+
 function SMSModal({job,onClose,onPreview,farmList,crewList}){
   const gfl=id=>farmList?farmList.find(f=>f.id===id):null;
   const gcl=id=>crewList?crewList.find(c=>c.id===id):null;
@@ -4445,8 +4534,11 @@ function SMSModal({job,onClose,onPreview,farmList,crewList}){
       return{to:c.phone,body:buildJobCardSMS(job,id,farmList,crewList,appUrl)};
     }).filter(Boolean);
 
-    if(sendToFarmer&&farmerPhone&&farmerName){
-      messages.push({to:farmerPhone,body:buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl)});
+    /* v4.6.11f: PHONE-ONLY. phone AND name silently dropped the farmer when the farm
+       record had a phone but a blank name (real field case 15 Jul) - tickbox on, no SMS,
+       no error. Blank name falls back to 'there' in the greeting. */
+    if(sendToFarmer&&farmerPhone){
+      messages.push({to:farmerPhone,body:buildFarmerSMS(job,farmerName||'there',farmerPhone,farmList,appUrl)});
     }
 
     if(messages.length===0){setStatus('error');return;}
@@ -4484,7 +4576,9 @@ function SMSModal({job,onClose,onPreview,farmList,crewList}){
         job.crew.map(id=>{
           const c=gcl(id);if(!c)return null;
           return e(CrewSMSRow,{key:id,id,c,views,status,onPreview,job,farmList,crewList,appUrl});
-        })
+        }),
+        /* v4.6.11e — farmer send row (individual send/re-send without re-texting crew) */
+        job.farmId&&e(FarmerSMSRow,{job,views,onPreview,farmList,appUrl,farmerName,farmerPhone})
       ),
       status==='sending'&&e('div',{className:'sent-state'},
         e('div',{style:{fontSize:40,marginBottom:8}},'📤'),
@@ -5738,9 +5832,14 @@ function App(){
          wipe bug. Wrapping everything in try/catch ensures any error here can't escape
          this block, and the deep-link logging is non-essential anyway. */
       try{
+        /* v4.6.11f: query string FIRST (?job=&crew= - survives PWA intent launches and
+           SMS linkifiers, both of which strip #fragments; proven in the field 15 Jul),
+           hash accepted as fallback so previously-sent links keep working. */
+        const search=window.location.search;
         const hash=window.location.hash;
-        const jobMatch=hash.match(/[#&]job=([^&]+)/);
-        const crewMatch=hash.match(/[#&]crew=([^&]+)/);
+        const src=(search&&/[?&]job=/.test(search))?search:hash;
+        const jobMatch=src.match(/[?#&]job=([^&]+)/);
+        const crewMatch=src.match(/[?#&]crew=([^&]+)/);
         if(jobMatch){
           const jid=jobMatch[1];
           const cid=crewMatch?crewMatch[1]:null;
@@ -5764,7 +5863,9 @@ function App(){
               try{logSaveFailure('diag_load','job_views_swallowed','err='+(viewErr&&viewErr.message||'unknown'));}catch(e){}
             }
           }
-          window.location.hash='';
+          /* v4.6.11f: one replaceState strips query AND hash without a reload or a
+             history entry; hash assignment kept as fallback for ancient browsers. */
+          try{window.history.replaceState(null,'',window.location.pathname);}catch(e){window.location.hash='';}
         }
       }catch(deepLinkErr){
         /* Final safety net: deep-link processing must never break the app. */
@@ -6128,6 +6229,11 @@ function App(){
        the effect returned, and no listeners were ever installed. flushNow / onVis self-check
        isFreshRef internally so they're safe to install before mountLoad finishes. */
     const flushNow=()=>{
+      /* v4.6.11e — dump any airborne per-cell tally writes into the queue
+         FIRST, before the isFresh gate below. writeTallyCell itself is not
+         freshness-gated (cells are last-write-wins user input), so the
+         hide-time rescue must not be gated either. */
+      try{flushInflightTallies();}catch(e){}
       /* Cancel any pending debounce — we're saving now */
       clearTimeout(saveTimer.current);
       /* PATCH v4.5.0: Don't push state we can't trust to Supabase.
